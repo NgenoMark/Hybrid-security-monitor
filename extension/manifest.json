@@ -1,0 +1,11 @@
+{
+  "manifest_version": 3,
+  "name": "Hybrid Security Monitor (Dev)",
+  "version": "0.1.0",
+  "permissions": ["tabs", "activeTab"],
+  "host_permissions": ["http://127.0.0.1:8787/*"],
+  "background": {
+    "service_worker": "background.js",
+    "type": "module"
+  }
+}
