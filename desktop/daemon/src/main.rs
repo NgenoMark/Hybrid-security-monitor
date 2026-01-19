@@ -1,6 +1,8 @@
 use axum::{routing::post, Json, Router};
+use jsonschema::JSONSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use std::sync::OnceLock;
 use tokio::fs;
 use tokio::io::AsyncWriteExt;
 use tracing::{error, info};
@@ -25,6 +27,18 @@ struct BrowserEventV1 {
 
 const LOG_DIR: &str = "logs";
 const LOG_FILE: &str = "logs/events.jsonl";
+const EVENT_SCHEMA_JSON: &str = include_str!("../../../shared/event.schema.json");
+
+fn event_schema() -> &'static JSONSchema {
+    static SCHEMA: OnceLock<JSONSchema> = OnceLock::new();
+    SCHEMA.get_or_init(|| {
+        let schema_json: Value =
+            serde_json::from_str(EVENT_SCHEMA_JSON).expect("Invalid event schema JSON");
+        JSONSchema::options()
+            .compile(&schema_json)
+            .expect("Failed to compile event schema")
+    })
+}
 
 async fn ensure_log_path() {
     if let Err(e) = fs::create_dir_all(LOG_DIR).await {
@@ -57,6 +71,20 @@ async fn append_jsonl(line: &str) {
 }
 
 async fn ingest(Json(payload): Json<BrowserEventV1>) -> Json<Value> {
+    let payload_value = match serde_json::to_value(&payload) {
+        Ok(value) => value,
+        Err(e) => {
+            error!("Failed to convert payload to JSON value: {}", e);
+            return Json(json!({ "ok": false, "error": "serialize_failed" }));
+        }
+    };
+
+    if let Err(errors) = event_schema().validate(&payload_value) {
+        for err in errors {
+            error!("Event schema validation error: {}", err);
+        }
+    }
+
     // Pretty log to console (good for dev)
     match serde_json::to_string_pretty(&payload) {
         Ok(pretty) => info!("Incoming event:\n{}", pretty),
