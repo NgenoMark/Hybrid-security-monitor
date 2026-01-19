@@ -1,0 +1,49 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://example.com/hybrid-security-monitor/event.schema.json",
+  "title": "BrowserEventV1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "event_type",
+    "ts_ms",
+    "url",
+    "origin",
+    "tab_id",
+    "details"
+  ],
+  "properties": {
+    "schema_version": {
+      "type": "string",
+      "description": "Schema version, e.g. \"1.0\""
+    },
+    "event_type": {
+      "type": "string",
+      "description": "Event type name"
+    },
+    "ts_ms": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Event timestamp in milliseconds"
+    },
+    "url": {
+      "type": ["string", "null"],
+      "description": "Full URL for the active tab when available"
+    },
+    "origin": {
+      "type": ["string", "null"],
+      "description": "Hostname derived from URL when available"
+    },
+    "tab_id": {
+      "type": ["integer", "null"],
+      "minimum": 0,
+      "description": "Chrome tab id when available"
+    },
+    "details": {
+      "type": "object",
+      "additionalProperties": true,
+      "description": "Event-specific payload"
+    }
+  }
+}
