@@ -749,6 +749,7 @@ async fn main() {
     let addr = "127.0.0.1:8787";
     info!("Desktop daemon listening on http://{}/ingest", addr);
     info!("Writing events to {}", LOG_FILE);
+    info!("Dashboard available at http://{}/dashboard", addr);
 
     let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
     axum::serve(listener, app).await.unwrap();
