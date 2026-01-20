@@ -58,5 +58,72 @@
     }
   } catch {}
 
+  // Tab visibility tracking
+  try {
+    const emitVisibility = () => {
+      const state = document.visibilityState === "hidden" ? "hidden" : "visible";
+      emit("tab_visibility", { state });
+    };
+
+    document.addEventListener("visibilitychange", emitVisibility);
+    emitVisibility();
+  } catch {}
+
+  // User activity heartbeat (rate-limited)
+  try {
+    const ACTIVITY_RATE_MS = 5000;
+    let lastActivityMs = 0;
+
+    const emitActivity = () => {
+      const now = Date.now();
+      if (now - lastActivityMs < ACTIVITY_RATE_MS) return;
+      lastActivityMs = now;
+      emit("user_activity", { active: true });
+    };
+
+    ["mousemove", "keydown", "scroll", "click"].forEach((eventName) => {
+      window.addEventListener(eventName, emitActivity, { passive: true });
+    });
+  } catch {}
+
+  // Media playback signal (no content)
+  try {
+    const MEDIA_HEARTBEAT_MS = 10000;
+    let lastMediaEmitMs = 0;
+
+    const emitMediaState = (state) => {
+      const now = Date.now();
+      if (state === "playing" && now - lastMediaEmitMs < MEDIA_HEARTBEAT_MS) return;
+      lastMediaEmitMs = now;
+      emit("media_playing", { state });
+    };
+
+    document.addEventListener(
+      "play",
+      () => emitMediaState("playing"),
+      { capture: true, passive: true }
+    );
+    document.addEventListener(
+      "pause",
+      () => emitMediaState("paused"),
+      { capture: true, passive: true }
+    );
+    document.addEventListener(
+      "ended",
+      () => emitMediaState("paused"),
+      { capture: true, passive: true }
+    );
+    document.addEventListener(
+      "timeupdate",
+      (event) => {
+        const target = event.target;
+        if (target && typeof target.paused === "boolean" && !target.paused) {
+          emitMediaState("playing");
+        }
+      },
+      { capture: true, passive: true }
+    );
+  } catch {}
+
   emit("instrumentation_loaded", { location: location.href });
 })();
