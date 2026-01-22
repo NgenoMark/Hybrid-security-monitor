@@ -83,6 +83,18 @@ chrome.tabs.onUpdated.addListener(async (tabId, changeInfo, tab) => {
   }
 });
 
+chrome.tabs.onRemoved.addListener(async (tabId) => {
+  try {
+    await sendEvent({
+      eventType: "tab_closed",
+      url: null,
+      tabId
+    });
+  } catch (e) {
+    console.warn("onRemoved error:", e);
+  }
+});
+
 
 async function sendRuntimeEvent(message, sender) {
   const tabId = sender?.tab?.id ?? null;
