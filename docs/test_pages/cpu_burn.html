@@ -1,0 +1,114 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>CPU Burn Test</title>
+    <style>
+      body {
+        font-family: "Segoe UI", sans-serif;
+        margin: 32px;
+        background: #f5f6f7;
+        color: #1f2328;
+      }
+      .card {
+        background: #ffffff;
+        border: 1px solid #d0d7de;
+        border-radius: 8px;
+        padding: 16px;
+        max-width: 720px;
+      }
+      button {
+        margin-right: 8px;
+        padding: 8px 12px;
+      }
+      .muted {
+        color: #57606a;
+        font-size: 14px;
+      }
+      #status {
+        margin-top: 12px;
+        font-weight: 600;
+      }
+    </style>
+  </head>
+  <body>
+    <div class="card">
+      <h1>CPU Burn</h1>
+      <p class="muted">Runs a sustained CPU loop in the main thread or worker.</p>
+      <button id="start-main">Start Main Thread Burn</button>
+      <button id="start-worker">Start Worker Burn</button>
+      <button id="stop" disabled>Stop Burn</button>
+      <div id="status">Status: idle</div>
+    </div>
+
+    <script>
+      let burning = false;
+      let worker = null;
+      const status = document.getElementById("status");
+      const stopButton = document.getElementById("stop");
+
+      function setStatus(text) {
+        status.textContent = `Status: ${text}`;
+      }
+
+      function burnLoop() {
+        if (!burning) return;
+        const start = performance.now();
+        while (performance.now() - start < 50) {
+          Math.sqrt(Math.random() * 1e6);
+        }
+        setTimeout(burnLoop, 0);
+      }
+
+      function startMain() {
+        if (burning) return;
+        burning = true;
+        setStatus("burning (main thread)");
+        stopButton.disabled = false;
+        burnLoop();
+      }
+
+      function startWorker() {
+        if (burning) return;
+        const workerCode = `
+          let running = true;
+          function burn() {
+            if (!running) return;
+            const start = performance.now();
+            while (performance.now() - start < 50) {
+              Math.sqrt(Math.random() * 1e6);
+            }
+            setTimeout(burn, 0);
+          }
+          burn();
+          onmessage = (event) => {
+            if (event.data === 'stop') {
+              running = false;
+            }
+          };
+        `;
+        const blob = new Blob([workerCode], { type: "text/javascript" });
+        worker = new Worker(URL.createObjectURL(blob));
+        burning = true;
+        setStatus("burning (worker)");
+        stopButton.disabled = false;
+      }
+
+      function stopBurn() {
+        burning = false;
+        if (worker) {
+          worker.postMessage("stop");
+          worker.terminate();
+          worker = null;
+        }
+        stopButton.disabled = true;
+        setStatus("idle");
+      }
+
+      document.getElementById("start-main").addEventListener("click", startMain);
+      document.getElementById("start-worker").addEventListener("click", startWorker);
+      stopButton.addEventListener("click", stopBurn);
+    </script>
+  </body>
+</html>
