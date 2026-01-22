@@ -46,6 +46,15 @@ const ALERT_COOLDOWN_MS: u64 = 30_000;
 const DASHBOARD_REFRESH_SECS: u64 = 3;
 const MAX_EVENT_HISTORY: usize = 50;
 const IGNORE_ORIGINS: [&str; 1] = ["127.0.0.1"];
+const WEIGHT_HIDDEN: f32 = 0.1;
+const WEIGHT_WORKER: f32 = 0.4;
+const WEIGHT_WASM: f32 = 0.5;
+const WEIGHT_MEDIA_PLAYING: f32 = 0.3;
+const WEIGHT_MEDIA_PAUSED: f32 = 0.05;
+const WEIGHT_IDLE: f32 = 0.1;
+const WEIGHT_CPU_HIGH_ACTIVE: f32 = 0.8;
+const WEIGHT_CPU_HIGH_GLOBAL: f32 = 0.5;
+const WEIGHT_CORRELATION_BONUS: f32 = 0.4;
 
 #[derive(Default)]
 struct CorrelationState {
@@ -103,6 +112,14 @@ struct DashboardSnapshot {
     active_origin: Option<String>,
     origins: Vec<OriginSnapshot>,
     last_events: Vec<EventSummary>,
+}
+
+struct OriginScore {
+    score: f32,
+    reasons: Vec<String>,
+    compute_present: bool,
+    hidden_present: bool,
+    idle_present: bool,
 }
 
 fn event_schema() -> &'static JSONSchema {
@@ -201,48 +218,157 @@ fn cpu_high(state: &CorrelationState, now_ms: u64) -> bool {
     )
 }
 
+fn decayed_weight(ts_ms: Option<u64>, now_ms: u64, window_ms: u64, weight: f32) -> f32 {
+    let Some(ts_ms) = ts_ms else {
+        return 0.0;
+    };
+    let age_ms = now_ms.saturating_sub(ts_ms);
+    if age_ms > window_ms {
+        return 0.0;
+    }
+    let remaining = 1.0 - (age_ms as f32 / window_ms as f32);
+    weight * remaining
+}
+
+fn score_origin(
+    origin_state: &OriginState,
+    now_ms: u64,
+    cpu_high: bool,
+    active: bool,
+    seen_recent: bool,
+) -> OriginScore {
+    let mut score = 0.0;
+    let mut reasons = Vec::new();
+
+    let hidden_contrib = decayed_weight(
+        origin_state.last_hidden_ms,
+        now_ms,
+        HIDDEN_RECENT_MS,
+        WEIGHT_HIDDEN,
+    );
+    if hidden_contrib > 0.0 {
+        score += hidden_contrib;
+        reasons.push("tab_hidden".to_string());
+    }
+
+    let worker_contrib = decayed_weight(
+        origin_state.last_worker_ms,
+        now_ms,
+        WORKER_RECENT_MS,
+        WEIGHT_WORKER,
+    );
+    if worker_contrib > 0.0 {
+        score += worker_contrib;
+        reasons.push("worker_created".to_string());
+    }
+
+    let wasm_contrib = decayed_weight(
+        origin_state.last_wasm_ms,
+        now_ms,
+        WASM_RECENT_MS,
+        WEIGHT_WASM,
+    );
+    if wasm_contrib > 0.0 {
+        score += wasm_contrib;
+        reasons.push("wasm_instantiate".to_string());
+    }
+
+    let media_state = origin_state.last_media_state.as_deref();
+    let media_playing_contrib = if media_state == Some("playing") {
+        decayed_weight(
+            origin_state.last_media_ms,
+            now_ms,
+            MEDIA_RECENT_MS,
+            WEIGHT_MEDIA_PLAYING,
+        )
+    } else {
+        0.0
+    };
+    if media_playing_contrib > 0.0 {
+        score += media_playing_contrib;
+        reasons.push("media_playing".to_string());
+    }
+
+    let media_paused_contrib = if media_state == Some("paused") {
+        decayed_weight(
+            origin_state.last_media_ms,
+            now_ms,
+            MEDIA_RECENT_MS,
+            WEIGHT_MEDIA_PAUSED,
+        )
+    } else {
+        0.0
+    };
+    if media_paused_contrib > 0.0 {
+        score += media_paused_contrib;
+        reasons.push("media_paused".to_string());
+    }
+
+    let idle = origin_state
+        .last_user_activity_ms
+        .map(|ts_ms| now_ms.saturating_sub(ts_ms) > IDLE_MS)
+        .unwrap_or(true);
+    let idle_contrib = if idle && seen_recent && !active {
+        WEIGHT_IDLE
+    } else {
+        0.0
+    };
+    if idle_contrib > 0.0 {
+        score += idle_contrib;
+        reasons.push("idle".to_string());
+    }
+
+    let compute_present = worker_contrib > 0.0 || wasm_contrib > 0.0 || media_playing_contrib > 0.0;
+    let hidden_present = hidden_contrib > 0.0;
+    let idle_present = idle_contrib > 0.0;
+
+    if cpu_high {
+        if active {
+            score += WEIGHT_CPU_HIGH_ACTIVE;
+            reasons.push("cpu_high_active".to_string());
+        } else if compute_present {
+            score += WEIGHT_CPU_HIGH_GLOBAL;
+            reasons.push("cpu_high_global".to_string());
+        }
+    }
+
+    if cpu_high && compute_present && hidden_present {
+        score += WEIGHT_CORRELATION_BONUS;
+        reasons.push("correlation_bonus".to_string());
+    }
+
+    OriginScore {
+        score,
+        reasons,
+        compute_present,
+        hidden_present,
+        idle_present,
+    }
+}
+
 fn evaluate_alerts(state: &mut CorrelationState, now_ms: u64) -> Vec<Alert> {
     let mut alerts = Vec::new();
-    if !cpu_high(state, now_ms) {
+    let cpu_high = cpu_high(state, now_ms);
+    if !cpu_high {
         return alerts;
     }
 
     for (origin, origin_state) in state.origins.iter() {
-        let hidden_recent = origin_state
-            .last_hidden_ms
-            .filter(|ts_ms| is_recent(*ts_ms, now_ms, HIDDEN_RECENT_MS))
-            .is_some();
-        let worker_recent = origin_state
-            .last_worker_ms
+        let seen_recent = origin_state
+            .last_seen_ms
             .filter(|ts_ms| is_recent(*ts_ms, now_ms, WORKER_RECENT_MS))
             .is_some();
-        let wasm_recent = origin_state
-            .last_wasm_ms
-            .filter(|ts_ms| is_recent(*ts_ms, now_ms, WASM_RECENT_MS))
-            .is_some();
-        let media_recent = origin_state
-            .last_media_ms
-            .filter(|ts_ms| is_recent(*ts_ms, now_ms, MEDIA_RECENT_MS))
-            .is_some();
-        let media_playing = media_recent
-            && origin_state
-                .last_media_state
-                .as_deref()
-                .map(|state| state == "playing")
-                .unwrap_or(false);
-        let idle = origin_state
-            .last_user_activity_ms
-            .map(|ts_ms| now_ms.saturating_sub(ts_ms) > IDLE_MS)
-            .unwrap_or(true);
+        let active = state
+            .active_origin
+            .as_ref()
+            .map(|active_origin| active_origin == origin)
+            .unwrap_or(false);
 
-        let compute_recent = worker_recent || wasm_recent || media_playing;
-        if !compute_recent {
+        let score_details = score_origin(origin_state, now_ms, cpu_high, active, seen_recent);
+        if !score_details.compute_present {
             continue;
         }
-        if !(hidden_recent || idle) {
-            continue;
-        }
-        if !(cpu_high(state, now_ms)) {
+        if !(score_details.hidden_present || score_details.idle_present) {
             continue;
         }
 
@@ -252,31 +378,13 @@ fn evaluate_alerts(state: &mut CorrelationState, now_ms: u64) -> Vec<Alert> {
             }
         }
 
-        let mut reasons = Vec::new();
-        if hidden_recent {
-            reasons.push("tab_hidden".to_string());
-        }
-        if idle {
-            reasons.push("idle".to_string());
-        }
-        if worker_recent {
-            reasons.push("worker_created".to_string());
-        }
-        if wasm_recent {
-            reasons.push("wasm_instantiate".to_string());
-        }
-        if media_recent {
-            reasons.push("media_playing".to_string());
-        }
-        reasons.push("cpu_high".to_string());
-
         let score = 1.0;
         state.last_alert_ms.insert(origin.clone(), now_ms);
 
         alerts.push(Alert {
             origin: origin.clone(),
             score,
-            reasons,
+            reasons: score_details.reasons,
             ts_ms: now_ms,
         });
     }
@@ -449,97 +557,27 @@ fn build_snapshot(state: &CorrelationState, now_ms: u64) -> DashboardSnapshot {
     let cpu_high_active = cpu_high && active_origin.is_some();
 
     for (origin, origin_state) in state.origins.iter() {
-        let mut reasons = Vec::new();
         let active = state
             .active_origin
             .as_ref()
             .map(|active_origin| active_origin == origin)
             .unwrap_or(false);
-        let hidden_recent = origin_state
-            .last_hidden_ms
-            .filter(|ts_ms| is_recent(*ts_ms, now_ms, HIDDEN_RECENT_MS))
-            .is_some();
-        let worker_recent = origin_state
-            .last_worker_ms
-            .filter(|ts_ms| is_recent(*ts_ms, now_ms, WORKER_RECENT_MS))
-            .is_some();
-        let wasm_recent = origin_state
-            .last_wasm_ms
-            .filter(|ts_ms| is_recent(*ts_ms, now_ms, WASM_RECENT_MS))
-            .is_some();
-        let media_recent = origin_state
-            .last_media_ms
-            .filter(|ts_ms| is_recent(*ts_ms, now_ms, MEDIA_RECENT_MS))
-            .is_some();
-        let media_playing = media_recent
-            && origin_state
-                .last_media_state
-                .as_deref()
-                .map(|state| state == "playing")
-                .unwrap_or(false);
-        let media_paused = media_recent
-            && origin_state
-                .last_media_state
-                .as_deref()
-                .map(|state| state == "paused")
-                .unwrap_or(false);
-        let idle = origin_state
-            .last_user_activity_ms
-            .map(|ts_ms| now_ms.saturating_sub(ts_ms) > IDLE_MS)
-            .unwrap_or(true);
         let seen_recent = origin_state
             .last_seen_ms
             .filter(|ts_ms| is_recent(*ts_ms, now_ms, WORKER_RECENT_MS))
             .is_some();
-
-        let mut score = 0.0;
-        if hidden_recent {
-            reasons.push("tab_hidden".to_string());
-            score += 0.1;
-        }
-        if worker_recent {
-            reasons.push("worker_created".to_string());
-            score += 0.4;
-        }
-        if wasm_recent {
-            reasons.push("recent_compute_event".to_string());
-            score += 0.5;
-        }
-        if media_playing {
-            reasons.push("media_playing".to_string());
-            score += 0.3;
-        }
-        if media_paused {
-            reasons.push("media_paused".to_string());
-        }
-        if cpu_high {
-            if active {
-                reasons.push("cpu_high_active".to_string());
-                score += 0.8;
-            } else if worker_recent || wasm_recent || media_recent {
-                reasons.push("cpu_high_global".to_string());
-                score += 0.5;
-            }
-        }
-        if idle && seen_recent && !active {
-            reasons.push("idle".to_string());
-        }
-
-        let compute_recent = worker_recent || wasm_recent || media_playing;
-        if hidden_recent && compute_recent && cpu_high {
-            reasons.push("correlation_bonus".to_string());
-            score += 0.4;
-        }
+        let score_details = score_origin(origin_state, now_ms, cpu_high, active, seen_recent);
 
         origins.push(OriginSnapshot {
             origin: origin.clone(),
-            score,
-            reasons,
+            score: score_details.score,
+            reasons: score_details.reasons,
             last_visibility: origin_state.last_visibility.clone(),
             last_compute_ms: origin_state
                 .last_worker_ms
                 .into_iter()
                 .chain(origin_state.last_wasm_ms)
+                .chain(origin_state.last_media_ms)
                 .max(),
         });
     }
