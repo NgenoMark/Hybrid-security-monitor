@@ -1,0 +1,66 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>WASM Only Test</title>
+    <style>
+      body {
+        font-family: "Segoe UI", sans-serif;
+        margin: 32px;
+        background: #f5f6f7;
+        color: #1f2328;
+      }
+      .card {
+        background: #ffffff;
+        border: 1px solid #d0d7de;
+        border-radius: 8px;
+        padding: 16px;
+        max-width: 720px;
+      }
+      button {
+        margin-right: 8px;
+        padding: 8px 12px;
+      }
+      .muted {
+        color: #57606a;
+        font-size: 14px;
+      }
+      #status {
+        margin-top: 12px;
+        font-weight: 600;
+      }
+    </style>
+  </head>
+  <body>
+    <div class="card">
+      <h1>WASM Only</h1>
+      <p class="muted">Instantiates a tiny WASM module to trigger wasm signals with low CPU.</p>
+      <button id="run">Instantiate WASM</button>
+      <div id="status">Status: idle</div>
+    </div>
+
+    <script>
+      const status = document.getElementById("status");
+
+      async function instantiateWasm() {
+        const wasmBytes = new Uint8Array([
+          0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00,
+          0x01, 0x04, 0x01, 0x60, 0x00, 0x00,
+          0x03, 0x02, 0x01, 0x00,
+          0x0a, 0x04, 0x01, 0x02, 0x00, 0x0b
+        ]);
+
+        try {
+          const module = await WebAssembly.compile(wasmBytes);
+          await WebAssembly.instantiate(module);
+          status.textContent = "Status: wasm instantiated";
+        } catch (err) {
+          status.textContent = "Status: wasm failed (" + err + ")";
+        }
+      }
+
+      document.getElementById("run").addEventListener("click", instantiateWasm);
+    </script>
+  </body>
+</html>

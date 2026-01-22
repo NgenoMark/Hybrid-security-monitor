@@ -1,0 +1,90 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Worker Only Test</title>
+    <style>
+      body {
+        font-family: "Segoe UI", sans-serif;
+        margin: 32px;
+        background: #f5f6f7;
+        color: #1f2328;
+      }
+      .card {
+        background: #ffffff;
+        border: 1px solid #d0d7de;
+        border-radius: 8px;
+        padding: 16px;
+        max-width: 720px;
+      }
+      button {
+        margin-right: 8px;
+        padding: 8px 12px;
+      }
+      .muted {
+        color: #57606a;
+        font-size: 14px;
+      }
+      #status {
+        margin-top: 12px;
+        font-weight: 600;
+      }
+    </style>
+  </head>
+  <body>
+    <div class="card">
+      <h1>Worker Only</h1>
+      <p class="muted">Spawns a light Web Worker to trigger worker signals with low CPU.</p>
+      <button id="start">Start Worker</button>
+      <button id="stop" disabled>Stop Worker</button>
+      <div id="status">Status: idle</div>
+    </div>
+
+    <script>
+      let worker = null;
+      const status = document.getElementById("status");
+      const startButton = document.getElementById("start");
+      const stopButton = document.getElementById("stop");
+
+      function setStatus(text) {
+        status.textContent = `Status: ${text}`;
+      }
+
+      function startWorker() {
+        if (worker) return;
+        const workerCode = `
+          let counter = 0;
+          setInterval(() => {
+            counter += 1;
+            if (counter % 50 === 0) {
+              postMessage({ type: 'tick', counter });
+            }
+          }, 100);
+        `;
+        const blob = new Blob([workerCode], { type: "text/javascript" });
+        worker = new Worker(URL.createObjectURL(blob));
+        worker.onmessage = (event) => {
+          if (event.data && event.data.type === "tick") {
+            setStatus("worker running (tick " + event.data.counter + ")");
+          }
+        };
+        setStatus("worker running");
+        startButton.disabled = true;
+        stopButton.disabled = false;
+      }
+
+      function stopWorker() {
+        if (!worker) return;
+        worker.terminate();
+        worker = null;
+        setStatus("idle");
+        startButton.disabled = false;
+        stopButton.disabled = true;
+      }
+
+      startButton.addEventListener("click", startWorker);
+      stopButton.addEventListener("click", stopWorker);
+    </script>
+  </body>
+</html>
