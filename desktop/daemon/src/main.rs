@@ -60,6 +60,8 @@ const WEIGHT_CORRELATION_BONUS: f32 = 0.4;
 struct CorrelationState {
     origins: HashMap<String, OriginState>,
     active_origin: Option<String>,
+    tab_to_origin: HashMap<u32, String>,
+    origin_tab_counts: HashMap<String, usize>,
     last_alert_ms: HashMap<String, u64>,
     cpu_high_since_ms: Option<u64>,
     last_cpu_pct: f32,
@@ -99,6 +101,7 @@ struct OriginSnapshot {
     origin: String,
     score: f32,
     reasons: Vec<String>,
+    contributions: Vec<ScoreContribution>,
     last_visibility: Option<String>,
     last_compute_ms: Option<u64>,
 }
@@ -114,9 +117,16 @@ struct DashboardSnapshot {
     last_events: Vec<EventSummary>,
 }
 
+#[derive(Debug, Serialize, Clone)]
+struct ScoreContribution {
+    name: String,
+    weight: f32,
+}
+
 struct OriginScore {
     score: f32,
     reasons: Vec<String>,
+    contributions: Vec<ScoreContribution>,
     compute_present: bool,
     hidden_present: bool,
     idle_present: bool,
@@ -239,6 +249,7 @@ fn score_origin(
 ) -> OriginScore {
     let mut score = 0.0;
     let mut reasons = Vec::new();
+    let mut contributions = Vec::new();
 
     let hidden_contrib = decayed_weight(
         origin_state.last_hidden_ms,
@@ -249,6 +260,10 @@ fn score_origin(
     if hidden_contrib > 0.0 {
         score += hidden_contrib;
         reasons.push("tab_hidden".to_string());
+        contributions.push(ScoreContribution {
+            name: "tab_hidden".to_string(),
+            weight: hidden_contrib,
+        });
     }
 
     let worker_contrib = decayed_weight(
@@ -260,6 +275,10 @@ fn score_origin(
     if worker_contrib > 0.0 {
         score += worker_contrib;
         reasons.push("worker_created".to_string());
+        contributions.push(ScoreContribution {
+            name: "worker_created".to_string(),
+            weight: worker_contrib,
+        });
     }
 
     let wasm_contrib = decayed_weight(
@@ -271,6 +290,10 @@ fn score_origin(
     if wasm_contrib > 0.0 {
         score += wasm_contrib;
         reasons.push("wasm_instantiate".to_string());
+        contributions.push(ScoreContribution {
+            name: "wasm_instantiate".to_string(),
+            weight: wasm_contrib,
+        });
     }
 
     let media_state = origin_state.last_media_state.as_deref();
@@ -287,6 +310,10 @@ fn score_origin(
     if media_playing_contrib > 0.0 {
         score += media_playing_contrib;
         reasons.push("media_playing".to_string());
+        contributions.push(ScoreContribution {
+            name: "media_playing".to_string(),
+            weight: media_playing_contrib,
+        });
     }
 
     let media_paused_contrib = if media_state == Some("paused") {
@@ -302,6 +329,10 @@ fn score_origin(
     if media_paused_contrib > 0.0 {
         score += media_paused_contrib;
         reasons.push("media_paused".to_string());
+        contributions.push(ScoreContribution {
+            name: "media_paused".to_string(),
+            weight: media_paused_contrib,
+        });
     }
 
     let idle = origin_state
@@ -316,6 +347,10 @@ fn score_origin(
     if idle_contrib > 0.0 {
         score += idle_contrib;
         reasons.push("idle".to_string());
+        contributions.push(ScoreContribution {
+            name: "idle".to_string(),
+            weight: idle_contrib,
+        });
     }
 
     let compute_present = worker_contrib > 0.0 || wasm_contrib > 0.0 || media_playing_contrib > 0.0;
@@ -326,20 +361,33 @@ fn score_origin(
         if active {
             score += WEIGHT_CPU_HIGH_ACTIVE;
             reasons.push("cpu_high_active".to_string());
+            contributions.push(ScoreContribution {
+                name: "cpu_high_active".to_string(),
+                weight: WEIGHT_CPU_HIGH_ACTIVE,
+            });
         } else if compute_present {
             score += WEIGHT_CPU_HIGH_GLOBAL;
             reasons.push("cpu_high_global".to_string());
+            contributions.push(ScoreContribution {
+                name: "cpu_high_global".to_string(),
+                weight: WEIGHT_CPU_HIGH_GLOBAL,
+            });
         }
     }
 
     if cpu_high && compute_present && hidden_present {
         score += WEIGHT_CORRELATION_BONUS;
         reasons.push("correlation_bonus".to_string());
+        contributions.push(ScoreContribution {
+            name: "correlation_bonus".to_string(),
+            weight: WEIGHT_CORRELATION_BONUS,
+        });
     }
 
     OriginScore {
         score,
         reasons,
+        contributions,
         compute_present,
         hidden_present,
         idle_present,
@@ -424,9 +472,49 @@ async fn handle_event(payload: &BrowserEventV1, state: &SharedState) {
         guard.events.pop_front();
     }
 
+    if payload.event_type == "tab_closed" {
+        if let Some(tab_id) = payload.tab_id {
+            if let Some(origin) = guard.tab_to_origin.remove(&tab_id) {
+                if let Some(count) = guard.origin_tab_counts.get_mut(&origin) {
+                    if *count > 0 {
+                        *count -= 1;
+                    }
+                    if *count == 0 {
+                        guard.origin_tab_counts.remove(&origin);
+                        guard.origins.remove(&origin);
+                        guard.last_alert_ms.remove(&origin);
+                        if guard.active_origin.as_deref() == Some(origin.as_str()) {
+                            guard.active_origin = None;
+                        }
+                    }
+                }
+            }
+        }
+        return;
+    }
+
     let Some(origin) = payload.origin.clone() else {
         return;
     };
+
+    if let Some(tab_id) = payload.tab_id {
+        let previous = guard.tab_to_origin.insert(tab_id, origin.clone());
+        if let Some(previous_origin) = previous {
+            if previous_origin != origin {
+                if let Some(count) = guard.origin_tab_counts.get_mut(&previous_origin) {
+                    if *count > 0 {
+                        *count -= 1;
+                    }
+                    if *count == 0 {
+                        guard.origin_tab_counts.remove(&previous_origin);
+                        guard.origins.remove(&previous_origin);
+                        guard.last_alert_ms.remove(&previous_origin);
+                    }
+                }
+            }
+        }
+        *guard.origin_tab_counts.entry(origin.clone()).or_insert(0) += 1;
+    }
 
     if payload.event_type == "tab_active" && !IGNORE_ORIGINS.contains(&origin.as_str()) {
         guard.active_origin = Some(origin.clone());
@@ -572,6 +660,7 @@ fn build_snapshot(state: &CorrelationState, now_ms: u64) -> DashboardSnapshot {
             origin: origin.clone(),
             score: score_details.score,
             reasons: score_details.reasons,
+            contributions: score_details.contributions,
             last_visibility: origin_state.last_visibility.clone(),
             last_compute_ms: origin_state
                 .last_worker_ms
@@ -644,6 +733,11 @@ async fn dashboard_html() -> Html<String> {
         border-bottom: 1px dashed #e6d8cb;
         font-size: 14px;
       }
+      .explain {
+        margin-top: 6px;
+        color: #5d5046;
+        font-size: 12px;
+      }
       .pill {
         display: inline-block;
         padding: 2px 8px;
@@ -695,7 +789,10 @@ async fn dashboard_html() -> Html<String> {
         data.origins.forEach((origin) => {
         const li = document.createElement("li");
         const scoreClass = origin.score > 0 ? "score-high" : "score-low";
-          li.innerHTML = `<span class="pill">${origin.origin}</span><span class="${scoreClass}">score ${origin.score.toFixed(1)}</span><div class="muted">${origin.reasons.join(", ") || "no reasons"}</div>`;
+          const explain = origin.contributions && origin.contributions.length
+            ? origin.contributions.map((c) => `${c.name}=${c.weight.toFixed(2)}`).join(", ")
+            : "no contributions";
+          li.innerHTML = `<span class="pill">${origin.origin}</span><span class="${scoreClass}">score ${origin.score.toFixed(2)}</span><div class="muted">${origin.reasons.join(", ") || "no reasons"}</div><div class="explain">Explain: ${explain}</div>`;
           origins.appendChild(li);
         });
 
