@@ -113,6 +113,7 @@ struct CorrelationState {
     config_last_modified: Option<SystemTime>,
     tabs: HashMap<u32, TabState>,
     active_tab_id: Option<u32>,
+    snoozed: HashMap<String, u64>,
     last_alert_ms: HashMap<String, u64>,
     cpu_high_since_ms: Option<u64>,
     last_cpu_pct: f32,
@@ -156,6 +157,7 @@ struct OriginSnapshot {
     contributions: Vec<ScoreContribution>,
     last_visibility: Option<String>,
     last_compute_ms: Option<u64>,
+    snoozed_until: Option<u64>,
 }
 
 #[derive(Debug, Serialize)]
@@ -165,6 +167,7 @@ struct DashboardSnapshot {
     cpu_high: bool,
     cpu_high_active: bool,
     active_origin: Option<String>,
+    snoozed_until: HashMap<String, u64>,
     origins: Vec<OriginSnapshot>,
     last_events: Vec<EventSummary>,
 }
@@ -388,6 +391,29 @@ async fn ingest(State(state): State<SharedState>, Json(payload): Json<BrowserEve
         "received_event_type": payload.event_type,
         "ts_ms": payload.ts_ms
     }))
+}
+
+#[derive(Deserialize)]
+struct SnoozeRequest {
+    origin: String,
+    minutes: Option<u64>,
+}
+
+async fn snooze_origin(
+    State(state): State<SharedState>,
+    Json(payload): Json<SnoozeRequest>,
+) -> Json<Value> {
+    let until_ms = match payload.minutes {
+        Some(minutes) => now_ms().saturating_add(minutes.saturating_mul(60_000)),
+        None => 0,
+    };
+    let mut guard = state.lock().await;
+    if until_ms == 0 {
+        guard.snoozed.remove(&payload.origin);
+    } else {
+        guard.snoozed.insert(payload.origin.clone(), until_ms);
+    }
+    Json(json!({ "ok": true, "origin": payload.origin, "snoozed_until": until_ms }))
 }
 
 fn now_ms() -> u64 {
@@ -628,6 +654,14 @@ fn evaluate_alerts(state: &mut CorrelationState, now_ms: u64) -> Vec<Alert> {
             continue;
         }
         if !(score_details.hidden_present || score_details.idle_present) {
+            continue;
+        }
+        if state
+            .snoozed
+            .get(origin)
+            .map(|until| *until > now_ms)
+            .unwrap_or(false)
+        {
             continue;
         }
 
@@ -879,7 +913,15 @@ fn build_snapshot(state: &CorrelationState, now_ms: u64) -> DashboardSnapshot {
         .active_tab_id
         .and_then(|tab_id| state.tabs.get(&tab_id))
         .and_then(|tab_state| tab_state.origin.clone())
-        .filter(|origin| !matches_any(&state.config.allowlist, origin));
+        .filter(|origin| {
+            !matches_any(&state.config.allowlist, origin)
+                && !state
+                    .snoozed
+                    .get(origin)
+                    .map(|until| *until > now_ms)
+                    .unwrap_or(false)
+        });
+    let snoozed_until = state.snoozed.clone();
     let cpu_high_active = cpu_high && active_origin.is_some();
 
     let mut by_origin: HashMap<String, OriginSnapshot> = HashMap::new();
@@ -910,6 +952,7 @@ fn build_snapshot(state: &CorrelationState, now_ms: u64) -> DashboardSnapshot {
                 .chain(tab_state.last_wasm_ms)
                 .chain(tab_state.last_media_ms)
                 .max(),
+            snoozed_until: state.snoozed.get(&origin).copied(),
         };
 
         by_origin
@@ -931,6 +974,7 @@ fn build_snapshot(state: &CorrelationState, now_ms: u64) -> DashboardSnapshot {
         cpu_high,
         cpu_high_active,
         active_origin,
+        snoozed_until,
         origins,
         last_events: state.events.iter().cloned().collect(),
     }
@@ -1005,6 +1049,26 @@ async fn dashboard_html() -> Html<String> {
       .score-low {
         color: #2a4a2a;
       }
+      .snooze-row {
+        margin-top: 6px;
+        display: flex;
+        gap: 6px;
+        align-items: center;
+      }
+      .snooze-row input {
+        width: 64px;
+        padding: 4px 6px;
+      }
+      .snooze-row button {
+        padding: 4px 8px;
+        border: 1px solid #c9b9aa;
+        background: #efe3d6;
+        border-radius: 6px;
+        cursor: pointer;
+      }
+      .snoozed {
+        opacity: 0.55;
+      }
     </style>
   </head>
   <body>
@@ -1041,11 +1105,44 @@ async fn dashboard_html() -> Html<String> {
         data.origins.forEach((origin) => {
         const li = document.createElement("li");
         const scoreClass = origin.score > 0 ? "score-high" : "score-low";
+          const snoozed = origin.snoozed_until && origin.snoozed_until > data.now_ms;
           const explain = origin.contributions && origin.contributions.length
             ? origin.contributions.map((c) => `${c.name}=${c.weight.toFixed(2)}`).join(", ")
             : "no contributions";
-          li.innerHTML = `<span class="pill">${origin.origin}</span><span class="${scoreClass}">score ${origin.score.toFixed(2)}</span><div class="muted">${origin.reasons.join(", ") || "no reasons"}</div><div class="explain">Explain: ${explain}</div>`;
+          li.innerHTML = `
+            <span class="pill">${origin.origin}</span>
+            <span class="${scoreClass}">score ${origin.score.toFixed(2)}</span>
+            <div class="muted">${origin.reasons.join(", ") || "no reasons"}</div>
+            <div class="explain">Explain: ${explain}</div>
+            <div class="snooze-row">
+              <label class="muted">Snooze (min)</label>
+              <input type="number" min="1" max="1440" value="15" />
+              <button data-origin="${origin.origin}">Snooze</button>
+              <button data-origin="${origin.origin}" data-unsnooze="true">Unsnooze</button>
+            </div>
+          `;
+          if (snoozed) {
+            li.classList.add("snoozed");
+          }
           origins.appendChild(li);
+          const button = li.querySelector("button");
+          const input = li.querySelector("input");
+          const unsnoozeButton = li.querySelector("button[data-unsnooze='true']");
+          button.addEventListener("click", async () => {
+            const minutes = Number(input.value || 15);
+            await fetch("/snooze", {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({ origin: origin.origin, minutes })
+            });
+          });
+          unsnoozeButton.addEventListener("click", async () => {
+            await fetch("/snooze", {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({ origin: origin.origin })
+            });
+          });
         });
 
         events.innerHTML = "";
@@ -1146,6 +1243,7 @@ async fn main() {
         config_last_modified,
         tabs: HashMap::new(),
         active_tab_id: None,
+        snoozed: HashMap::new(),
         last_alert_ms: HashMap::new(),
         cpu_high_since_ms: None,
         last_cpu_pct: 0.0,
@@ -1157,6 +1255,7 @@ async fn main() {
 
     let app = Router::new()
         .route("/ingest", post(ingest))
+        .route("/snooze", post(snooze_origin))
         .route("/dashboard", get(dashboard_html))
         .route("/dashboard/data", get(dashboard_data))
         .with_state(state);
