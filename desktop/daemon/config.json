@@ -1,0 +1,16 @@
+{
+  "allowlist": [
+    "127.0.0.1",
+    "www.youtube.com"
+  ],
+  "denylist": [],
+  "origin_overrides": {
+    "example.com": {
+      "alert_score_threshold": 0.8,
+      "weights": {
+        "cpu_high_active": 1.0,
+        "correlation_bonus": 0.6
+      }
+    }
+  }
+}
