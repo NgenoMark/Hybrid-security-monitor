@@ -55,9 +55,59 @@ const WEIGHT_IDLE: f32 = 0.1;
 const WEIGHT_CPU_HIGH_ACTIVE: f32 = 0.8;
 const WEIGHT_CPU_HIGH_GLOBAL: f32 = 0.5;
 const WEIGHT_CORRELATION_BONUS: f32 = 0.4;
+const WEIGHT_DENYLIST: f32 = 0.6;
+const DEFAULT_ALERT_SCORE_THRESHOLD: f32 = 1.0;
+const CONFIG_FILE: &str = "config.json";
 
-#[derive(Default)]
+#[derive(Debug, Deserialize, Default)]
+struct Config {
+    #[serde(default)]
+    allowlist: Vec<String>,
+    #[serde(default)]
+    denylist: Vec<String>,
+    #[serde(default)]
+    origin_overrides: HashMap<String, OriginOverride>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct OriginOverride {
+    #[serde(default)]
+    alert_score_threshold: Option<f32>,
+    #[serde(default)]
+    weights: Option<WeightOverrides>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct WeightOverrides {
+    hidden: Option<f32>,
+    worker: Option<f32>,
+    wasm: Option<f32>,
+    media_playing: Option<f32>,
+    media_paused: Option<f32>,
+    idle: Option<f32>,
+    cpu_high_active: Option<f32>,
+    cpu_high_global: Option<f32>,
+    correlation_bonus: Option<f32>,
+    denylist: Option<f32>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct Weights {
+    hidden: f32,
+    worker: f32,
+    wasm: f32,
+    media_playing: f32,
+    media_paused: f32,
+    idle: f32,
+    cpu_high_active: f32,
+    cpu_high_global: f32,
+    correlation_bonus: f32,
+    denylist: f32,
+}
+
 struct CorrelationState {
+    config: Config,
+    config_last_modified: Option<SystemTime>,
     tabs: HashMap<u32, TabState>,
     active_tab_id: Option<u32>,
     last_alert_ms: HashMap<String, u64>,
@@ -129,6 +179,7 @@ struct OriginScore {
     compute_present: bool,
     hidden_present: bool,
     idle_present: bool,
+    skipped: bool,
 }
 
 fn event_schema() -> &'static JSONSchema {
@@ -140,6 +191,129 @@ fn event_schema() -> &'static JSONSchema {
             .compile(&schema_json)
             .expect("Failed to compile event schema")
     })
+}
+
+fn load_config() -> (Config, Option<SystemTime>) {
+    match std::fs::read_to_string(CONFIG_FILE) {
+        Ok(contents) => match serde_json::from_str::<Config>(&contents) {
+            Ok(config) => {
+                let modified = std::fs::metadata(CONFIG_FILE)
+                    .ok()
+                    .and_then(|meta| meta.modified().ok());
+                (config, modified)
+            }
+            Err(e) => {
+                error!("Failed to parse {}: {}", CONFIG_FILE, e);
+                (Config::default(), None)
+            }
+        },
+        Err(e) => {
+            info!("No {} found ({}), using defaults.", CONFIG_FILE, e);
+            (Config::default(), None)
+        }
+    }
+}
+
+fn matches_pattern(pattern: &str, value: &str) -> bool {
+    if pattern == "*" {
+        return true;
+    }
+    if !pattern.contains('*') {
+        return pattern == value;
+    }
+    let mut remainder = value;
+    let mut first = true;
+    for part in pattern.split('*').filter(|part| !part.is_empty()) {
+        if let Some(index) = remainder.find(part) {
+            if first && !pattern.starts_with('*') && index != 0 {
+                return false;
+            }
+            remainder = &remainder[index + part.len()..];
+            first = false;
+        } else {
+            return false;
+        }
+    }
+    if !pattern.ends_with('*') && !remainder.is_empty() {
+        return false;
+    }
+    true
+}
+
+fn matches_any(patterns: &[String], value: &str) -> bool {
+    patterns.iter().any(|pattern| matches_pattern(pattern, value))
+}
+
+fn build_weights(origin: &str, config: &Config) -> Weights {
+    let mut weights = Weights {
+        hidden: WEIGHT_HIDDEN,
+        worker: WEIGHT_WORKER,
+        wasm: WEIGHT_WASM,
+        media_playing: WEIGHT_MEDIA_PLAYING,
+        media_paused: WEIGHT_MEDIA_PAUSED,
+        idle: WEIGHT_IDLE,
+        cpu_high_active: WEIGHT_CPU_HIGH_ACTIVE,
+        cpu_high_global: WEIGHT_CPU_HIGH_GLOBAL,
+        correlation_bonus: WEIGHT_CORRELATION_BONUS,
+        denylist: WEIGHT_DENYLIST,
+    };
+
+    if let Some(override_entry) = config.origin_overrides.get(origin) {
+        if let Some(overrides) = override_entry.weights.as_ref() {
+            if let Some(value) = overrides.hidden {
+                weights.hidden = value;
+            }
+            if let Some(value) = overrides.worker {
+                weights.worker = value;
+            }
+            if let Some(value) = overrides.wasm {
+                weights.wasm = value;
+            }
+            if let Some(value) = overrides.media_playing {
+                weights.media_playing = value;
+            }
+            if let Some(value) = overrides.media_paused {
+                weights.media_paused = value;
+            }
+            if let Some(value) = overrides.idle {
+                weights.idle = value;
+            }
+            if let Some(value) = overrides.cpu_high_active {
+                weights.cpu_high_active = value;
+            }
+            if let Some(value) = overrides.cpu_high_global {
+                weights.cpu_high_global = value;
+            }
+            if let Some(value) = overrides.correlation_bonus {
+                weights.correlation_bonus = value;
+            }
+            if let Some(value) = overrides.denylist {
+                weights.denylist = value;
+            }
+        }
+    }
+
+    weights
+}
+
+fn refresh_config_if_needed(state: &mut CorrelationState) {
+    let modified = std::fs::metadata(CONFIG_FILE)
+        .ok()
+        .and_then(|meta| meta.modified().ok());
+    if modified.is_none() {
+        return;
+    }
+    let needs_reload = match (state.config_last_modified, modified) {
+        (Some(prev), Some(next)) => next > prev,
+        (None, Some(_)) => true,
+        _ => false,
+    };
+    if needs_reload {
+        let (config, last_modified) = load_config();
+        state.config = config;
+        state.config_last_modified = last_modified;
+        info!("Reloaded {}", CONFIG_FILE);
+    }
 }
 
 async fn ensure_log_path() {
@@ -241,11 +415,27 @@ fn decayed_weight(ts_ms: Option<u64>, now_ms: u64, window_ms: u64, weight: f32) 
 
 fn score_tab(
     tab_state: &TabState,
+    origin: &str,
+    config: &Config,
     now_ms: u64,
     cpu_high: bool,
     active: bool,
     seen_recent: bool,
 ) -> OriginScore {
+    if matches_any(&config.allowlist, origin) {
+        return OriginScore {
+            score: 0.0,
+            reasons: Vec::new(),
+            contributions: Vec::new(),
+            compute_present: false,
+            hidden_present: false,
+            idle_present: false,
+            skipped: true,
+        };
+    }
+
+    let weights = build_weights(origin, config);
+
     let mut score = 0.0;
     let mut reasons = Vec::new();
     let mut contributions = Vec::new();
@@ -254,7 +444,7 @@ fn score_tab(
         tab_state.last_hidden_ms,
         now_ms,
         HIDDEN_RECENT_MS,
-        WEIGHT_HIDDEN,
+        weights.hidden,
     );
     if hidden_contrib > 0.0 {
         score += hidden_contrib;
@@ -269,7 +459,7 @@ fn score_tab(
         tab_state.last_worker_ms,
         now_ms,
         WORKER_RECENT_MS,
-        WEIGHT_WORKER,
+        weights.worker,
     );
     if worker_contrib > 0.0 {
         score += worker_contrib;
@@ -284,7 +474,7 @@ fn score_tab(
         tab_state.last_wasm_ms,
         now_ms,
         WASM_RECENT_MS,
-        WEIGHT_WASM,
+        weights.wasm,
     );
     if wasm_contrib > 0.0 {
         score += wasm_contrib;
@@ -301,7 +491,7 @@ fn score_tab(
             tab_state.last_media_ms,
             now_ms,
             MEDIA_RECENT_MS,
-            WEIGHT_MEDIA_PLAYING,
+            weights.media_playing,
         )
     } else {
         0.0
@@ -320,7 +510,7 @@ fn score_tab(
             tab_state.last_media_ms,
             now_ms,
             MEDIA_RECENT_MS,
-            WEIGHT_MEDIA_PAUSED,
+            weights.media_paused,
         )
     } else {
         0.0
@@ -339,7 +529,7 @@ fn score_tab(
         .map(|ts_ms| now_ms.saturating_sub(ts_ms) > IDLE_MS)
         .unwrap_or(true);
     let idle_contrib = if idle && seen_recent && !active {
-        WEIGHT_IDLE
+        weights.idle
     } else {
         0.0
     };
@@ -358,28 +548,37 @@ fn score_tab(
 
     if cpu_high {
         if active {
-            score += WEIGHT_CPU_HIGH_ACTIVE;
+            score += weights.cpu_high_active;
             reasons.push("cpu_high_active".to_string());
             contributions.push(ScoreContribution {
                 name: "cpu_high_active".to_string(),
-                weight: WEIGHT_CPU_HIGH_ACTIVE,
+                weight: weights.cpu_high_active,
             });
         } else if compute_present {
-            score += WEIGHT_CPU_HIGH_GLOBAL;
+            score += weights.cpu_high_global;
             reasons.push("cpu_high_global".to_string());
             contributions.push(ScoreContribution {
                 name: "cpu_high_global".to_string(),
-                weight: WEIGHT_CPU_HIGH_GLOBAL,
+                weight: weights.cpu_high_global,
             });
         }
     }
 
     if cpu_high && compute_present && hidden_present {
-        score += WEIGHT_CORRELATION_BONUS;
+        score += weights.correlation_bonus;
         reasons.push("correlation_bonus".to_string());
         contributions.push(ScoreContribution {
             name: "correlation_bonus".to_string(),
-            weight: WEIGHT_CORRELATION_BONUS,
+            weight: weights.correlation_bonus,
+        });
+    }
+
+    if matches_any(&config.denylist, origin) {
+        score += weights.denylist;
+        reasons.push("denylisted".to_string());
+        contributions.push(ScoreContribution {
+            name: "denylisted".to_string(),
+            weight: weights.denylist,
         });
     }
 
@@ -390,6 +589,7 @@ fn score_tab(
         compute_present,
         hidden_present,
         idle_present,
+        skipped: false,
     }
 }
 
@@ -412,7 +612,11 @@ fn evaluate_alerts(state: &mut CorrelationState, now_ms: u64) -> Vec<Alert> {
             .is_some();
         let active = state.active_tab_id == Some(*tab_id);
 
-        let score_details = score_tab(tab_state, now_ms, cpu_high, active, seen_recent);
+        let score_details =
+            score_tab(tab_state, origin, &state.config, now_ms, cpu_high, active, seen_recent);
+        if score_details.skipped {
+            continue;
+        }
         if !score_details.compute_present {
             continue;
         }
@@ -427,6 +631,7 @@ fn evaluate_alerts(state: &mut CorrelationState, now_ms: u64) -> Vec<Alert> {
             compute_present: false,
             hidden_present: false,
             idle_present: false,
+            skipped: false,
         });
         if score_details.score > entry.score {
             *entry = score_details;
@@ -438,6 +643,16 @@ fn evaluate_alerts(state: &mut CorrelationState, now_ms: u64) -> Vec<Alert> {
             if is_recent(*last_alert_ms, now_ms, ALERT_COOLDOWN_MS) {
                 continue;
             }
+        }
+
+        let threshold = state
+            .config
+            .origin_overrides
+            .get(&origin)
+            .and_then(|override_entry| override_entry.alert_score_threshold)
+            .unwrap_or(DEFAULT_ALERT_SCORE_THRESHOLD);
+        if score_details.score < threshold {
+            continue;
         }
 
         let score = 1.0;
@@ -477,6 +692,7 @@ async fn emit_alert(alert: Alert) {
 
 async fn handle_event(payload: &BrowserEventV1, state: &SharedState) {
     let mut guard = state.lock().await;
+    refresh_config_if_needed(&mut guard);
     guard.events.push_back(EventSummary {
         ts_ms: payload.ts_ms,
         event_type: payload.event_type.clone(),
@@ -504,7 +720,9 @@ async fn handle_event(payload: &BrowserEventV1, state: &SharedState) {
     let incoming_origin = payload.origin.clone();
     if payload.event_type == "tab_active" {
         if let Some(origin) = incoming_origin.as_ref() {
-            if !IGNORE_ORIGINS.contains(&origin.as_str()) {
+            if !matches_any(&guard.config.allowlist, origin)
+                && !IGNORE_ORIGINS.contains(&origin.as_str())
+            {
                 guard.active_tab_id = Some(tab_id);
             } else {
                 guard.active_tab_id = None;
@@ -581,6 +799,7 @@ fn chrome_cpu_pct(system: &System) -> f32 {
 async fn sample_cpu(state: &SharedState, cpu_pct: f32, ts_ms: u64) {
     {
         let mut guard = state.lock().await;
+        refresh_config_if_needed(&mut guard);
         guard.last_cpu_pct = cpu_pct;
         if cpu_pct >= CPU_HIGH_THRESHOLD_PCT {
             if guard.cpu_high_since_ms.is_none() {
@@ -639,7 +858,8 @@ fn build_snapshot(state: &CorrelationState, now_ms: u64) -> DashboardSnapshot {
     let active_origin = state
         .active_tab_id
         .and_then(|tab_id| state.tabs.get(&tab_id))
-        .and_then(|tab_state| tab_state.origin.clone());
+        .and_then(|tab_state| tab_state.origin.clone())
+        .filter(|origin| !matches_any(&state.config.allowlist, origin));
     let cpu_high_active = cpu_high && active_origin.is_some();
 
     let mut by_origin: HashMap<String, OriginSnapshot> = HashMap::new();
@@ -652,7 +872,11 @@ fn build_snapshot(state: &CorrelationState, now_ms: u64) -> DashboardSnapshot {
             .last_seen_ms
             .filter(|ts_ms| is_recent(*ts_ms, now_ms, WORKER_RECENT_MS))
             .is_some();
-        let score_details = score_tab(tab_state, now_ms, cpu_high, active, seen_recent);
+        let score_details =
+            score_tab(tab_state, &origin, &state.config, now_ms, cpu_high, active, seen_recent);
+        if score_details.skipped {
+            continue;
+        }
 
         let snapshot = OriginSnapshot {
             origin: origin.clone(),
@@ -879,7 +1103,17 @@ async fn main() {
     tracing_subscriber::fmt::init();
     ensure_log_path().await;
 
-    let state = Arc::new(Mutex::new(CorrelationState::default()));
+    let (config, config_last_modified) = load_config();
+    let state = Arc::new(Mutex::new(CorrelationState {
+        config,
+        config_last_modified,
+        tabs: HashMap::new(),
+        active_tab_id: None,
+        last_alert_ms: HashMap::new(),
+        cpu_high_since_ms: None,
+        last_cpu_pct: 0.0,
+        events: VecDeque::new(),
+    }));
     start_cpu_sampler(state.clone()).await;
     start_terminal_dashboard(state.clone()).await;
 
