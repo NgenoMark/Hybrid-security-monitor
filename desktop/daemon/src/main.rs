@@ -33,6 +33,8 @@ struct BrowserEventV1 {
 
 const LOG_DIR: &str = "logs";
 const LOG_FILE: &str = "logs/events.jsonl";
+const SNAPSHOT_LOG_FILE: &str = "logs/snapshots.jsonl";
+const ALERT_LOG_FILE: &str = "logs/alerts.jsonl";
 const EVENT_SCHEMA_JSON: &str = include_str!("../../../shared/event.schema.json");
 const CPU_SAMPLE_INTERVAL_SECS: u64 = 2;
 const CPU_HIGH_THRESHOLD_PCT: f32 = 25.0;
@@ -45,6 +47,7 @@ const IDLE_MS: u64 = 15_000;
 const ALERT_COOLDOWN_MS: u64 = 30_000;
 const DASHBOARD_REFRESH_SECS: u64 = 3;
 const MAX_EVENT_HISTORY: usize = 50;
+const SNAPSHOT_INTERVAL_SECS: u64 = 5;
 const IGNORE_ORIGINS: [&str; 1] = ["127.0.0.1"];
 const WEIGHT_HIDDEN: f32 = 0.1;
 const WEIGHT_WORKER: f32 = 0.4;
@@ -323,16 +326,20 @@ async fn ensure_log_path() {
 }
 
 async fn append_jsonl(line: &str) {
+    append_jsonl_to(LOG_FILE, line).await;
+}
+
+async fn append_jsonl_to(path: &str, line: &str) {
     // Open in append mode (create if missing)
     let mut file = match tokio::fs::OpenOptions::new()
         .create(true)
         .append(true)
-        .open(LOG_FILE)
+        .open(path)
         .await
     {
         Ok(f) => f,
         Err(e) => {
-            error!("Failed to open log file '{}': {}", LOG_FILE, e);
+            error!("Failed to open log file '{}': {}", path, e);
             return;
         }
     };
@@ -342,7 +349,7 @@ async fn append_jsonl(line: &str) {
         return;
     }
     if let Err(e) = file.write_all(b"\n").await {
-        error!("Failed to write newline to log file '{}': {}", LOG_FILE, e);
+        error!("Failed to write newline to log file '{}': {}", path, e);
     }
 }
 
@@ -688,6 +695,19 @@ async fn emit_alert(alert: Alert) {
     });
 
     log_json(value).await;
+    log_alert_json(&alert).await;
+}
+
+async fn log_alert_json(alert: &Alert) {
+    let value = json!({
+        "ts_ms": alert.ts_ms,
+        "origin": alert.origin,
+        "score": alert.score,
+        "reasons": alert.reasons
+    });
+    if let Ok(line) = serde_json::to_string(&value) {
+        append_jsonl_to(ALERT_LOG_FILE, &line).await;
+    }
 }
 
 async fn handle_event(payload: &BrowserEventV1, state: &SharedState) {
@@ -1098,6 +1118,23 @@ async fn start_terminal_dashboard(state: SharedState) {
     });
 }
 
+async fn start_snapshot_logger(state: SharedState) {
+    tokio::spawn(async move {
+        let mut ticker = interval(Duration::from_secs(SNAPSHOT_INTERVAL_SECS));
+        loop {
+            ticker.tick().await;
+            let now_ms = now_ms();
+            let guard = state.lock().await;
+            let snapshot = build_snapshot(&guard, now_ms);
+            drop(guard);
+
+            if let Ok(line) = serde_json::to_string(&snapshot) {
+                append_jsonl_to(SNAPSHOT_LOG_FILE, &line).await;
+            }
+        }
+    });
+}
+
 #[tokio::main]
 async fn main() {
     tracing_subscriber::fmt::init();
@@ -1116,6 +1153,7 @@ async fn main() {
     }));
     start_cpu_sampler(state.clone()).await;
     start_terminal_dashboard(state.clone()).await;
+    start_snapshot_logger(state.clone()).await;
 
     let app = Router::new()
         .route("/ingest", post(ingest))
