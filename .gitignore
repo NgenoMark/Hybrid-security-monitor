@@ -2,3 +2,5 @@
 **/node_modules
 .DS_Store
 desktop/daemon/logs/events.jsonl
+desktop/daemon/logs/snapshots.jsonl
+desktop/daemon/logs/alerts.jsonl
