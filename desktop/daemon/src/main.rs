@@ -58,10 +58,8 @@ const WEIGHT_CORRELATION_BONUS: f32 = 0.4;
 
 #[derive(Default)]
 struct CorrelationState {
-    origins: HashMap<String, OriginState>,
-    active_origin: Option<String>,
-    tab_to_origin: HashMap<u32, String>,
-    origin_tab_counts: HashMap<String, usize>,
+    tabs: HashMap<u32, TabState>,
+    active_tab_id: Option<u32>,
     last_alert_ms: HashMap<String, u64>,
     cpu_high_since_ms: Option<u64>,
     last_cpu_pct: f32,
@@ -69,7 +67,8 @@ struct CorrelationState {
 }
 
 #[derive(Debug, Clone, Default)]
-struct OriginState {
+struct TabState {
+    origin: Option<String>,
     last_visibility: Option<String>,
     last_hidden_ms: Option<u64>,
     last_worker_ms: Option<u64>,
@@ -96,7 +95,7 @@ struct EventSummary {
     origin: Option<String>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Clone)]
 struct OriginSnapshot {
     origin: String,
     score: f32,
@@ -240,8 +239,8 @@ fn decayed_weight(ts_ms: Option<u64>, now_ms: u64, window_ms: u64, weight: f32) 
     weight * remaining
 }
 
-fn score_origin(
-    origin_state: &OriginState,
+fn score_tab(
+    tab_state: &TabState,
     now_ms: u64,
     cpu_high: bool,
     active: bool,
@@ -252,7 +251,7 @@ fn score_origin(
     let mut contributions = Vec::new();
 
     let hidden_contrib = decayed_weight(
-        origin_state.last_hidden_ms,
+        tab_state.last_hidden_ms,
         now_ms,
         HIDDEN_RECENT_MS,
         WEIGHT_HIDDEN,
@@ -267,7 +266,7 @@ fn score_origin(
     }
 
     let worker_contrib = decayed_weight(
-        origin_state.last_worker_ms,
+        tab_state.last_worker_ms,
         now_ms,
         WORKER_RECENT_MS,
         WEIGHT_WORKER,
@@ -282,7 +281,7 @@ fn score_origin(
     }
 
     let wasm_contrib = decayed_weight(
-        origin_state.last_wasm_ms,
+        tab_state.last_wasm_ms,
         now_ms,
         WASM_RECENT_MS,
         WEIGHT_WASM,
@@ -296,10 +295,10 @@ fn score_origin(
         });
     }
 
-    let media_state = origin_state.last_media_state.as_deref();
+    let media_state = tab_state.last_media_state.as_deref();
     let media_playing_contrib = if media_state == Some("playing") {
         decayed_weight(
-            origin_state.last_media_ms,
+            tab_state.last_media_ms,
             now_ms,
             MEDIA_RECENT_MS,
             WEIGHT_MEDIA_PLAYING,
@@ -318,7 +317,7 @@ fn score_origin(
 
     let media_paused_contrib = if media_state == Some("paused") {
         decayed_weight(
-            origin_state.last_media_ms,
+            tab_state.last_media_ms,
             now_ms,
             MEDIA_RECENT_MS,
             WEIGHT_MEDIA_PAUSED,
@@ -335,7 +334,7 @@ fn score_origin(
         });
     }
 
-    let idle = origin_state
+    let idle = tab_state
         .last_user_activity_ms
         .map(|ts_ms| now_ms.saturating_sub(ts_ms) > IDLE_MS)
         .unwrap_or(true);
@@ -401,18 +400,19 @@ fn evaluate_alerts(state: &mut CorrelationState, now_ms: u64) -> Vec<Alert> {
         return alerts;
     }
 
-    for (origin, origin_state) in state.origins.iter() {
-        let seen_recent = origin_state
+    let mut by_origin: HashMap<String, OriginScore> = HashMap::new();
+    for (tab_id, tab_state) in state.tabs.iter() {
+        let origin = match tab_state.origin.as_ref() {
+            Some(origin) => origin,
+            None => continue,
+        };
+        let seen_recent = tab_state
             .last_seen_ms
             .filter(|ts_ms| is_recent(*ts_ms, now_ms, WORKER_RECENT_MS))
             .is_some();
-        let active = state
-            .active_origin
-            .as_ref()
-            .map(|active_origin| active_origin == origin)
-            .unwrap_or(false);
+        let active = state.active_tab_id == Some(*tab_id);
 
-        let score_details = score_origin(origin_state, now_ms, cpu_high, active, seen_recent);
+        let score_details = score_tab(tab_state, now_ms, cpu_high, active, seen_recent);
         if !score_details.compute_present {
             continue;
         }
@@ -420,7 +420,21 @@ fn evaluate_alerts(state: &mut CorrelationState, now_ms: u64) -> Vec<Alert> {
             continue;
         }
 
-        if let Some(last_alert_ms) = state.last_alert_ms.get(origin) {
+        let entry = by_origin.entry(origin.clone()).or_insert_with(|| OriginScore {
+            score: 0.0,
+            reasons: Vec::new(),
+            contributions: Vec::new(),
+            compute_present: false,
+            hidden_present: false,
+            idle_present: false,
+        });
+        if score_details.score > entry.score {
+            *entry = score_details;
+        }
+    }
+
+    for (origin, score_details) in by_origin {
+        if let Some(last_alert_ms) = state.last_alert_ms.get(&origin) {
             if is_recent(*last_alert_ms, now_ms, ALERT_COOLDOWN_MS) {
                 continue;
             }
@@ -430,7 +444,7 @@ fn evaluate_alerts(state: &mut CorrelationState, now_ms: u64) -> Vec<Alert> {
         state.last_alert_ms.insert(origin.clone(), now_ms);
 
         alerts.push(Alert {
-            origin: origin.clone(),
+            origin,
             score,
             reasons: score_details.reasons,
             ts_ms: now_ms,
@@ -474,74 +488,55 @@ async fn handle_event(payload: &BrowserEventV1, state: &SharedState) {
 
     if payload.event_type == "tab_closed" {
         if let Some(tab_id) = payload.tab_id {
-            if let Some(origin) = guard.tab_to_origin.remove(&tab_id) {
-                if let Some(count) = guard.origin_tab_counts.get_mut(&origin) {
-                    if *count > 0 {
-                        *count -= 1;
-                    }
-                    if *count == 0 {
-                        guard.origin_tab_counts.remove(&origin);
-                        guard.origins.remove(&origin);
-                        guard.last_alert_ms.remove(&origin);
-                        if guard.active_origin.as_deref() == Some(origin.as_str()) {
-                            guard.active_origin = None;
-                        }
-                    }
+            if guard.tabs.remove(&tab_id).is_some() {
+                if guard.active_tab_id == Some(tab_id) {
+                    guard.active_tab_id = None;
                 }
             }
         }
         return;
     }
 
-    let Some(origin) = payload.origin.clone() else {
+    let Some(tab_id) = payload.tab_id else {
         return;
     };
 
-    if let Some(tab_id) = payload.tab_id {
-        let previous = guard.tab_to_origin.insert(tab_id, origin.clone());
-        if let Some(previous_origin) = previous {
-            if previous_origin != origin {
-                if let Some(count) = guard.origin_tab_counts.get_mut(&previous_origin) {
-                    if *count > 0 {
-                        *count -= 1;
-                    }
-                    if *count == 0 {
-                        guard.origin_tab_counts.remove(&previous_origin);
-                        guard.origins.remove(&previous_origin);
-                        guard.last_alert_ms.remove(&previous_origin);
-                    }
-                }
+    let incoming_origin = payload.origin.clone();
+    if payload.event_type == "tab_active" {
+        if let Some(origin) = incoming_origin.as_ref() {
+            if !IGNORE_ORIGINS.contains(&origin.as_str()) {
+                guard.active_tab_id = Some(tab_id);
+            } else {
+                guard.active_tab_id = None;
             }
         }
-        *guard.origin_tab_counts.entry(origin.clone()).or_insert(0) += 1;
     }
 
-    if payload.event_type == "tab_active" && !IGNORE_ORIGINS.contains(&origin.as_str()) {
-        guard.active_origin = Some(origin.clone());
+    let tab_state = guard.tabs.entry(tab_id).or_default();
+    if let Some(origin) = incoming_origin {
+        tab_state.origin = Some(origin);
     }
-
-    let entry = guard.origins.entry(origin.clone()).or_default();
 
     match payload.event_type.as_str() {
         "tab_active" => {
-            entry.last_seen_ms = Some(payload.ts_ms);
+            tab_state.last_seen_ms = Some(payload.ts_ms);
         }
         "tab_visibility" => {
             if let Some(state_value) = payload.details.get("state").and_then(|value| value.as_str()) {
-                entry.last_visibility = Some(state_value.to_string());
+                tab_state.last_visibility = Some(state_value.to_string());
                 if state_value == "hidden" {
-                    entry.last_hidden_ms = Some(payload.ts_ms);
+                    tab_state.last_hidden_ms = Some(payload.ts_ms);
                 }
             }
-            entry.last_seen_ms = Some(payload.ts_ms);
+            tab_state.last_seen_ms = Some(payload.ts_ms);
         }
         "wasm_instantiate" => {
-            entry.last_wasm_ms = Some(payload.ts_ms);
-            entry.last_seen_ms = Some(payload.ts_ms);
+            tab_state.last_wasm_ms = Some(payload.ts_ms);
+            tab_state.last_seen_ms = Some(payload.ts_ms);
         }
         "worker_created" => {
-            entry.last_worker_ms = Some(payload.ts_ms);
-            entry.last_seen_ms = Some(payload.ts_ms);
+            tab_state.last_worker_ms = Some(payload.ts_ms);
+            tab_state.last_seen_ms = Some(payload.ts_ms);
         }
         "media_playing" => {
             let state = payload
@@ -549,13 +544,13 @@ async fn handle_event(payload: &BrowserEventV1, state: &SharedState) {
                 .get("state")
                 .and_then(|value| value.as_str())
                 .unwrap_or("playing");
-            entry.last_media_state = Some(state.to_string());
-            entry.last_media_ms = Some(payload.ts_ms);
-            entry.last_seen_ms = Some(payload.ts_ms);
+            tab_state.last_media_state = Some(state.to_string());
+            tab_state.last_media_ms = Some(payload.ts_ms);
+            tab_state.last_seen_ms = Some(payload.ts_ms);
         }
         "user_activity" => {
-            entry.last_user_activity_ms = Some(payload.ts_ms);
-            entry.last_seen_ms = Some(payload.ts_ms);
+            tab_state.last_user_activity_ms = Some(payload.ts_ms);
+            tab_state.last_seen_ms = Some(payload.ts_ms);
         }
         _ => {}
     }
@@ -641,36 +636,49 @@ async fn start_cpu_sampler(state: SharedState) {
 fn build_snapshot(state: &CorrelationState, now_ms: u64) -> DashboardSnapshot {
     let cpu_high = cpu_high(state, now_ms);
     let mut origins = Vec::new();
-    let active_origin = state.active_origin.clone();
+    let active_origin = state
+        .active_tab_id
+        .and_then(|tab_id| state.tabs.get(&tab_id))
+        .and_then(|tab_state| tab_state.origin.clone());
     let cpu_high_active = cpu_high && active_origin.is_some();
 
-    for (origin, origin_state) in state.origins.iter() {
-        let active = state
-            .active_origin
-            .as_ref()
-            .map(|active_origin| active_origin == origin)
-            .unwrap_or(false);
-        let seen_recent = origin_state
+    let mut by_origin: HashMap<String, OriginSnapshot> = HashMap::new();
+    for (tab_id, tab_state) in state.tabs.iter() {
+        let Some(origin) = tab_state.origin.clone() else {
+            continue;
+        };
+        let active = state.active_tab_id == Some(*tab_id);
+        let seen_recent = tab_state
             .last_seen_ms
             .filter(|ts_ms| is_recent(*ts_ms, now_ms, WORKER_RECENT_MS))
             .is_some();
-        let score_details = score_origin(origin_state, now_ms, cpu_high, active, seen_recent);
+        let score_details = score_tab(tab_state, now_ms, cpu_high, active, seen_recent);
 
-        origins.push(OriginSnapshot {
+        let snapshot = OriginSnapshot {
             origin: origin.clone(),
             score: score_details.score,
             reasons: score_details.reasons,
             contributions: score_details.contributions,
-            last_visibility: origin_state.last_visibility.clone(),
-            last_compute_ms: origin_state
+            last_visibility: tab_state.last_visibility.clone(),
+            last_compute_ms: tab_state
                 .last_worker_ms
                 .into_iter()
-                .chain(origin_state.last_wasm_ms)
-                .chain(origin_state.last_media_ms)
+                .chain(tab_state.last_wasm_ms)
+                .chain(tab_state.last_media_ms)
                 .max(),
-        });
+        };
+
+        by_origin
+            .entry(origin)
+            .and_modify(|existing| {
+                if snapshot.score > existing.score {
+                    *existing = snapshot.clone();
+                }
+            })
+            .or_insert(snapshot);
     }
 
+    origins.extend(by_origin.into_values());
     origins.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
 
     DashboardSnapshot {
